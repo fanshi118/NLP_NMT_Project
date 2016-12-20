@@ -15,30 +15,28 @@ import tensorflow as tf
 
 import data_utils
 import nltk
-from tensorflow.models.rnn.translate import seq2seq_model
-
+# from tensorflow.models.rnn.translate import seq2seq_model
+import seq2seq_model
 
 tf.app.flags.DEFINE_float("learning_rate", 0.5, "Learning rate.")
 tf.app.flags.DEFINE_float("learning_rate_decay_factor", 0.99,
                           "Learning rate decays by this much.")
 tf.app.flags.DEFINE_float("max_gradient_norm", 5.0,
                           "Clip gradients to this norm.")
-tf.app.flags.DEFINE_integer("batch_size", 64,
+tf.app.flags.DEFINE_integer("batch_size", 32,
                             "Batch size to use during training.")
-tf.app.flags.DEFINE_integer("size", 1024, "Size of each model layer.")
-tf.app.flags.DEFINE_integer("num_layers", 3, "Number of layers in the model.")
+tf.app.flags.DEFINE_integer("size", 512, "Size of each model layer.")
+tf.app.flags.DEFINE_integer("num_layers", 2, "Number of layers in the model.")
 tf.app.flags.DEFINE_integer("s_vocab_size", 30000, "Source language vocabulary size.")
 tf.app.flags.DEFINE_integer("t_vocab_size", 30000, "Target language vocabulary size.")
-tf.app.flags.DEFINE_string("data_dir", "/Users/fancyshmancy/Development/nlp/proj/data/", "Data directory")
-tf.app.flags.DEFINE_string("train_dir", "/Users/fancyshmancy/Development/nlp/proj/runs/0/", "Training directory.")
+tf.app.flags.DEFINE_string("data_dir", "/Users/fancyshmancy/Development/nlp/proj2/data/", "Data directory")
+tf.app.flags.DEFINE_string("train_dir", "/Users/fancyshmancy/Development/nlp/proj2/runs/de_en_lstm_reg/", "Training directory.")
 tf.app.flags.DEFINE_integer("max_train_data_size", 0,
                             "Limit on the size of training data (0: no limit).")
 tf.app.flags.DEFINE_integer("steps_per_checkpoint", 200,
                             "How many training steps to do per checkpoint.")
 tf.app.flags.DEFINE_boolean("use_fp16", False,
                             "Train using fp16 instead of fp32.")
-# tf.app.flags.DEFINE_boolean("attention", False,
-#                             "If using attention or not.")
 
 FLAGS = tf.app.flags.FLAGS
 
@@ -82,7 +80,7 @@ def read_data(source_path, target_path, max_size=None):
   return data_set
 
 
-def create_model(session, forward_only):
+def create_model(session, use_lstm, forward_only):
   """Create translation model and initialize or load parameters in session."""
   dtype = tf.float16 if FLAGS.use_fp16 else tf.float32
   model = seq2seq_model.Seq2SeqModel(
@@ -95,11 +93,12 @@ def create_model(session, forward_only):
       FLAGS.batch_size,
       FLAGS.learning_rate,
       FLAGS.learning_rate_decay_factor,
-      # FLAGS.attention,
+      use_lstm=use_lstm,
       forward_only=forward_only,
       dtype=dtype)
   ckpt = tf.train.get_checkpoint_state(FLAGS.train_dir)
-  if ckpt and tf.train.checkpoint_exists(ckpt.model_checkpoint_path):
+  if ckpt:
+  # and tf.train.checkpoint_exists(ckpt.model_checkpoint_path):
     print("Reading model parameters from %s" % ckpt.model_checkpoint_path)
     model.saver.restore(session, ckpt.model_checkpoint_path)
   else:
@@ -116,12 +115,11 @@ def train():
   print("Preparing NMT data in %s" % FLAGS.data_dir)
   print("    source langauge: %s" % source)
   print("    target language: %s" % target)
-  s_train, t_train, s_dev, t_dev, _, _ = data_utils.prepare_data(FLAGS.data_dir, FLAGS.s_vocab_size, FLAGS.t_vocab_size, source, target)
-
+  s_train, t_train, s_dev, t_dev, _, _, _, _ = data_utils.prepare_data(FLAGS.data_dir, FLAGS.s_vocab_size, FLAGS.t_vocab_size, source, target)
   with tf.Session() as sess:
     # Create model.
     print("Creating %d layers of %d units." % (FLAGS.num_layers, FLAGS.size))
-    model = create_model(sess, False)
+    model = create_model(sess, False, False)
 
     # Read data into buckets and compute their sizes.
     print("Reading development and training data (limit: %d)."
@@ -141,7 +139,10 @@ def train():
     step_time, loss = 0.0, 0.0
     current_step = 0
     previous_losses = []
-    while True:
+    perplexity = 1e10
+    train_steps, train_ppx, bucket_ppx = [], [], {0:[], 1:[], 2:[], 3:[]}
+    
+    while perplexity>20.:
       # Choose a bucket according to data distribution. We pick a random number
       # in [0, 1] and use the corresponding interval in train_buckets_scale.
       random_number_01 = np.random.random_sample()
@@ -160,8 +161,10 @@ def train():
 
       # Once in a while, we save checkpoint, print statistics, and run evals.
       if current_step % FLAGS.steps_per_checkpoint == 0:
+        train_steps.append(current_step)
         # Print statistics for the previous epoch.
         perplexity = math.exp(float(loss)) if loss < 300 else float("inf")
+        train_ppx.append(perplexity)
         print("global step %d learning rate %.4f step-time %.2f perplexity "
               "%.2f" % (model.global_step.eval(), model.learning_rate.eval(),
                         step_time, perplexity))
@@ -183,16 +186,85 @@ def train():
           _, eval_loss, _ = model.step(sess, encoder_inputs, decoder_inputs,
                                        target_weights, bucket_id, True)
           eval_ppx = math.exp(float(eval_loss)) if eval_loss < 300 else float("inf")
+          bucket_ppx[bucket_id].append(eval_ppx)
           print("  eval: bucket %d perplexity %.2f" % (bucket_id, eval_ppx))
           eval_loss_tot += eval_loss
         eval_loss_avg = eval_loss_tot/len(_buckets)
         eval_ppx = math.exp(float(eval_loss_avg)) if eval_loss < 300 else float("inf")
         print("  eval: mean perplexity %.2f" % eval_ppx)
         sys.stdout.flush()
+    print(train_steps)
+    print(train_ppx)
+    print(bucket_ppx)
+
+
+def testBLEU():
+  source = sys.argv[1]
+  target = sys.argv[2]
+  with tf.Session() as sess:
+    # Create model and load parameters.
+    model = create_model(sess, True, True)
+    model.batch_size = 1  # We decode one sentence at a time.
+
+    # Load vocabularies.
+    s_vocab_path = os.path.join(FLAGS.data_dir,
+                                "vocab%d.%s" % (FLAGS.s_vocab_size, source))
+    t_vocab_path = os.path.join(FLAGS.data_dir,
+                                "vocab%d.%s" % (FLAGS.t_vocab_size, target))
+    s_vocab, _ = data_utils.initialize_vocabulary(s_vocab_path)
+    _, rev_t_vocab = data_utils.initialize_vocabulary(t_vocab_path)
+
+    # Decode from standard input.
+    BLEUscore = {0:[], 1:[], 2:[], 3:[]}
+    s_test_path = os.path.join(FLAGS.data_dir, "test.%s" % source)
+    t_test_path = os.path.join(FLAGS.data_dir, "test.%s" % target)
+    f_s = open(s_test_path, 'r')
+    f_t = open(t_test_path, 'r')
+    # print(f_s.readline())
+    step = 0
+    for sentence in f_s:
+      print(step)
+      # sentence = f_ja.readline()
+      # Get token-ids for the input sentence.
+      token_ids = data_utils.sentence_to_token_ids(tf.compat.as_bytes(sentence), s_vocab)
+      # Which bucket does it belong to?
+      bucket_id = len(_buckets) - 1
+      for i, bucket in enumerate(_buckets):
+        if bucket[0] >= len(token_ids):
+          bucket_id = i
+          break
+      else:
+        logging.warning("Sentence truncated: %s", sentence) 
+
+      # Get a 1-element batch to feed the sentence to the model.
+      encoder_inputs, decoder_inputs, target_weights = model.get_batch(
+          {bucket_id: [(token_ids, [])]}, bucket_id)
+      # Get output logits for the sentence.
+      _, _, output_logits = model.step(sess, encoder_inputs, decoder_inputs,
+                                       target_weights, bucket_id, True)
+      # This is a greedy decoder - outputs are just argmaxes of output_logits.
+      outputs = [int(np.argmax(logit, axis=1)) for logit in output_logits]
+      # If there is an EOS symbol in outputs, cut them at that point.
+      if data_utils.EOS_ID in outputs:
+        outputs = outputs[:outputs.index(data_utils.EOS_ID)]
+      # Print out Japanese sentence corresponding to outputs.
+      candidate = [tf.compat.as_str(rev_t_vocab[output]) for output in outputs]
+      reference = f_t.readline().split(' ')
+      try:
+        temp_score = nltk.translate.bleu_score.sentence_bleu([reference], candidate)
+      except:
+        temp_score = nltk.translate.bleu_score.sentence_bleu([reference], candidate, weights=(.5, .5))
+      BLEUscore[bucket_id].append(temp_score)
+      step += 1
+      print(temp_score)
+    for key,val in BLEUscore.iteritems():
+      print(key, ": ", np.mean(val))
+    # print(np.mean(BLEUscore))
 
 
 def main(_):
-  train()
+  # train()
+  testBLEU()
 
 
 if __name__ == "__main__":
